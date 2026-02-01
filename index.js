@@ -1,8 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const mongoose = require('mongoose');
-const fs = require('fs');
-const path = require('path');
 
 // Environment variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -52,7 +50,14 @@ const userSchema = new mongoose.Schema({
     donateViews: { type: Number, default: 0 }
 }, { timestamps: true });
 
+const coffeeImageSchema = new mongoose.Schema({
+    fileId: { type: String, required: true },
+    uploadedBy: { type: Number, required: true },
+    uploadedAt: { type: Date, default: Date.now }
+}, { timestamps: true });
+
 const User = mongoose.model('User', userSchema);
+const CoffeeImage = mongoose.model('CoffeeImage', coffeeImageSchema);
 
 // Connect to MongoDB
 mongoose.connect(MONGODB_URI)
@@ -71,7 +76,7 @@ async function saveUserData(msg, action = 'start') {
         let userData = await User.findOne({ userId });
 
         if (userData) {
-            // Update existing user
+            // Update existing user - don't increment anything for duplicates
             userData.username = user.username || null;
             userData.firstName = user.first_name || null;
             userData.lastName = user.last_name || null;
@@ -85,9 +90,9 @@ async function saveUserData(msg, action = 'start') {
             }
             
             await userData.save();
-            console.log(`📝 Updated user: ${userId} - Action: ${action}`);
+            console.log(`📝 Updated user: ${userId} (${user.username || 'no username'}) - Action: ${action}`);
         } else {
-            // Create new user
+            // Create new user - only count as new user once
             userData = new User({
                 userId,
                 username: user.username || null,
@@ -100,7 +105,7 @@ async function saveUserData(msg, action = 'start') {
             });
             
             await userData.save();
-            console.log(`✨ New user saved: ${userId} - Action: ${action}`);
+            console.log(`✨ New user saved: ${userId} (${user.username || 'no username'}) - Action: ${action}`);
         }
 
         return userData;
@@ -207,23 +212,16 @@ bot.on('photo', async (msg) => {
         const photo = msg.photo[msg.photo.length - 1]; // Get highest quality photo
         const fileId = photo.file_id;
         
-        // Download the photo
-        const file = await bot.getFile(fileId);
-        const filePath = file.file_path;
-        const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-        
-        // Download and save as coffee.jpg
-        const https = require('https');
-        const imageStream = fs.createWriteStream(path.join(__dirname, 'coffee.jpg'));
-        
-        https.get(downloadUrl, (response) => {
-            response.pipe(imageStream);
-            imageStream.on('finish', async () => {
-                imageStream.close();
-                await bot.sendMessage(chatId, '✅ Coffee image updated successfully!');
-                console.log('📷 Coffee image updated by admin');
-            });
+        // Save file_id to database
+        const coffeeImage = new CoffeeImage({
+            fileId: fileId,
+            uploadedBy: userId
         });
+        
+        await coffeeImage.save();
+        
+        await bot.sendMessage(chatId, '✅ Coffee image updated successfully! The image will now be used in /donate command.');
+        console.log(`📷 Coffee image updated by admin (User ID: ${userId})`);
     } catch (error) {
         console.error('❌ Error saving photo:', error);
         await bot.sendMessage(chatId, '❌ Error saving image. Please try again.');
@@ -279,6 +277,60 @@ bot.onText(/\/stats/, async (msg) => {
     }
 });
 
+// Admin command: /users - Get list of all users
+bot.onText(/\/users(?:\s+(\d+))?/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const page = parseInt(match[1]) || 1;
+    const perPage = 20;
+
+    // Check if user is admin
+    if (!ADMIN_USER_ID || userId.toString() !== ADMIN_USER_ID) {
+        return; // Silently ignore for non-admins
+    }
+
+    try {
+        const totalUsers = await User.countDocuments();
+        const totalPages = Math.ceil(totalUsers / perPage);
+        const skip = (page - 1) * perPage;
+
+        const users = await User.find()
+            .sort({ firstSeen: -1 })
+            .skip(skip)
+            .limit(perPage);
+
+        if (users.length === 0) {
+            await bot.sendMessage(chatId, '📊 No users found.');
+            return;
+        }
+
+        let message = `👥 <b>Users List (Page ${page}/${totalPages})</b>\n`;
+        message += `<b>Total Users:</b> ${totalUsers}\n\n`;
+        
+        users.forEach((user, index) => {
+            const num = skip + index + 1;
+            const username = user.username ? `@${user.username}` : 'No username';
+            const name = `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'No name';
+            const premium = user.isPremium ? '💎' : '';
+            
+            message += `${num}. ${name} ${premium}\n`;
+            message += `   👤 ${username}\n`;
+            message += `   🆔 <code>${user.userId}</code>\n`;
+            message += `   📅 ${user.firstSeen.toLocaleDateString()}\n`;
+            message += `   💬 Interactions: ${user.totalInteractions} | ☕ Views: ${user.donateViews}\n\n`;
+        });
+
+        if (totalPages > 1) {
+            message += `\n📄 Use /users ${page + 1} for next page`;
+        }
+
+        await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+    } catch (error) {
+        console.error('❌ Error fetching users:', error);
+        await bot.sendMessage(chatId, '❌ Error fetching users list.');
+    }
+});
+
 // Function to send donate message with image
 async function sendDonateMessage(chatId) {
     const donateText = 
@@ -293,18 +345,18 @@ async function sendDonateMessage(chatId) {
         'Thank you for supporting WallSwipe ❤️';
     
     try {
-        // Check if coffee image exists
-        const imagePath = path.join(__dirname, 'coffee.jpg');
+        // Get coffee image from database
+        const coffeeImage = await CoffeeImage.findOne().sort({ uploadedAt: -1 });
         
-        if (fs.existsSync(imagePath)) {
-            // Send with image
-            await bot.sendPhoto(chatId, imagePath, {
+        if (coffeeImage && coffeeImage.fileId) {
+            // Send with image using file_id from database
+            await bot.sendPhoto(chatId, coffeeImage.fileId, {
                 caption: donateText,
                 parse_mode: 'HTML'
             });
             console.log(`✅ Donate message with image sent to ${chatId}`);
         } else {
-            // Send without image
+            // Send without image if no image in database
             await bot.sendMessage(chatId, donateText, {
                 parse_mode: 'HTML'
             });
@@ -312,6 +364,14 @@ async function sendDonateMessage(chatId) {
         }
     } catch (error) {
         console.error('❌ Error sending donate message:', error);
+        // Fallback to text only if image fails
+        try {
+            await bot.sendMessage(chatId, donateText, {
+                parse_mode: 'HTML'
+            });
+        } catch (err) {
+            console.error('❌ Error sending fallback message:', err);
+        }
     }
 }
 
